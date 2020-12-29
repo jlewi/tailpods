@@ -23,15 +23,15 @@ import (
 )
 
 type options struct {
-	labels string
-	container string
+	labels     string
+	container  string
 	kubeConfig string
-	namespace string
+	namespace  string
 }
 
 var (
-	log  logr.Logger
-	o = options{}
+	log logr.Logger
+	o   = options{}
 
 	rootCmd = &cobra.Command{
 		Use:   "tailpods",
@@ -84,22 +84,26 @@ func init() {
 	rootCmd.MarkFlagRequired("namespace")
 }
 
-func tail(o options) error {
-	setup()
+func watchForLatestPod(o options, clientset *kubernetes.Clientset, podName chan string) {
+	watcher, err := clientset.CoreV1().Pods(o.namespace).Watch(context.TODO(), metav1.ListOptions{
+		LabelSelector: o.labels,
+	})
 
-
-	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", o.kubeConfig)
 	if err != nil {
-		return err
+		panic(err)
 	}
 
-	// create the clientset
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return err
-	}
 	for {
+		select {
+		case e := <-watcher.ResultChan():
+			log.Info("Observed watch event", "event", e)
+		// TODO(jeremy): Can we set a longer timeout? The timeout is just intended to recover in case the watch
+		// misses some events.
+		case <-time.After(60 * time.Second):
+			log.Info("Timeout waiting for watch events")
+		}
+
+		// Now get the latest pods.
 		pods, err := clientset.CoreV1().Pods(o.namespace).List(context.TODO(), metav1.ListOptions{
 			LabelSelector: o.labels,
 		})
@@ -119,35 +123,74 @@ func tail(o options) error {
 			}
 		}
 		log.Info("Found latest pod", "pod", latestPod.Name)
+		podName <- latestPod.Name
+	}
+}
 
-		s, err := clientset.CoreV1().Pods(o.namespace).GetLogs(latestPod.Name, &v1.PodLogOptions{
+func tail(o options) error {
+	setup()
+
+	// use the current context in kubeconfig
+	config, err := clientcmd.BuildConfigFromFlags("", o.kubeConfig)
+	if err != nil {
+		return err
+	}
+
+	// create the clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	podNameChan := make(chan string, 10)
+	log.Info("Starting pod watcher")
+	go watchForLatestPod(o, clientset, podNameChan)
+
+	// Wait for the latest podName
+	latestName := <- podNameChan
+
+	for {
+		log.Info("Starting to stream pod logs", "pod", latestName)
+		s, err := clientset.CoreV1().Pods(o.namespace).GetLogs(latestName, &v1.PodLogOptions{
 			Container: o.container,
-			Follow: true,
+			Follow:    true,
 		}).Stream(context.TODO())
 
 		if err != nil {
 			log.Error(err, "There was a problem streaming the logs")
 		}
 
-		// Create a really large buffer
-		buffer := make([]byte, 10*1e6)
-		for ;; {
-			numRead, err := s.Read(buffer)
+		func() {
+			// Create a really large buffer
+			buffer := make([]byte, 10*1e6)
+			for {
+				numRead, err := s.Read(buffer)
 
-			lines := strings.Split(string(buffer[0:numRead]), "\n")
+				lines := strings.Split(string(buffer[0:numRead]), "\n")
 
-			log.Info("Read logs", "numBytes", numRead, "numLines", len(lines), "pod", latestPod.Name)
-			for _, l := range lines {
-				fmt.Printf("%v\n", l)
+				log.Info("Read logs", "numBytes", numRead, "numLines", len(lines), "pod", latestName)
+				for _, l := range lines {
+					fmt.Printf("%v\n", l)
+				}
+
+				if err == io.EOF {
+					log.Info("Stream terminated")
+					return
+				}
+
+				// Check if there is a new podName
+				select {
+				case newName := <-podNameChan:
+					latestName = newName
+					log.Info("Detected new pod", "pod", newName)
+					return
+				case <-time.After(2 * time.Second):
+					continue
+				}
 			}
+		}()
 
-			if err == io.EOF {
-				log.Info("Stream terminated")
-				break
-			}
-		}
 
-		time.Sleep(10 * time.Second)
 	}
 
 	return nil
